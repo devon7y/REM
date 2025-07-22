@@ -144,19 +144,19 @@ for ll_idx = 1:num_list_lengths
             all_phi_targets(sim_idx) = phi_target;
             
             % --- Simulate a Lure Trial (Recognition of an Unstudied Word) ---
-            % Generate a new word that was NOT in the study list (a lure)
-            probe_lure = generate_word_vector(param.num_total_features, param.w_word_features, param.g);
+            % Generate a new word that was NOT in the study list (a l)
+            probe_distractor = generate_word_vector(param.num_total_features, param.w_word_features, param.g);
             
-            % Calculate the overall odds (phi) for the lure probe
-            phi_lure = calculate_overall_odds(probe_lure, memory_images, param.c, param.g);
+            % Calculate the overall odds (phi) for the distractor probe
+            phi_distractor = calculate_overall_odds(probe_distractor, memory_images, param.c, param.g);
             
             % Make recognition decision
-            if phi_lure >= param.criterion
+            if phi_distractor >= param.criterion
                 total_false_alarms = total_false_alarms + 1;
             end
             
-            % Store phi_lure for later calculation of d' and NRS
-            all_phi_lures(sim_idx) = phi_lure;
+            % Store phi_distractor for later calculation of d' and NRS
+            all_phi_lures(sim_idx) = phi_distractor;
         end
         
         % --- Calculate and Store Results for Current List Length and Repetition ---
