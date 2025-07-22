@@ -117,14 +117,14 @@ for ll_idx = 1:num_list_lengths
             % Initialize an empty array of word vectors
             study_words = cell(current_list_length, 1);
             % Initialize an empty array of episodic images
-            memory_images = cell(current_list_length, 1);
+            memory_images = zeros(current_list_length, param.num_total_features);
             
             % For the number of words in the list length
             for i = 1:current_list_length
                 % Create a word vector representation from the geometric distribution
                 study_words{i} = generate_word_vector(param.num_total_features, param.w_word_features, param.g);
                 % Store the word in memory as an episodic image, which may have errors
-                memory_images{i} = store_word_into_memory(study_words{i}, param.u_star, param.t, param.c, param.g);
+                memory_images(i, :) = store_word_into_memory(study_words{i}, param.u_star, param.t, param.c, param.g);
             end
             
             % --- Simulate a Target Trial (Recognition of a Studied Word) ---
@@ -342,9 +342,9 @@ end
 % Function to calculate the overall odds (phi) for a probe
 function phi = calculate_overall_odds(probe_vector, memory_images, c_copy, g_param)
     sum_lambda = 0;
-    n_images = length(memory_images);
+    n_images = size(memory_images, 1);
     for i = 1:n_images
-        current_image = memory_images{i};
+        current_image = memory_images(i, :);
         sum_lambda = sum_lambda + calculate_lambda_single_image(probe_vector, current_image, c_copy, g_param);
     end
     if n_images > 0
