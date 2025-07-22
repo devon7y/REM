@@ -1,271 +1,355 @@
-%% Representation
+% REM Memory Simulation Script (Shiffrin & Steyvers, 1997)
+% This script simulates a basic recognition memory experiment
+% using the core principles of the REM model, including feature
+% representation, probabilistic storage, likelihood ratio calculation,
+% and decision making based on the average likelihood ratio (phi)
 
-% 1. Environmental Feature Distribution
-% Global parameter for the environmental geometric distribution
-gen_g_env = 0.1;
+% Set a seed for testing purposes
+rng(69); % Keep this for reproducibility of a specific run
 
-% Define a sufficiently large maximum feature value for the environmental distribution
-max_feature_value_possible = 100; 
+% --- Define Model and Simulation Parameters ---
+disp('--- REM Model Simulation ---');
+disp('Parameters:');
 
-% Pre-calculate the probabilities P(v) for v = 1 to max_feature_value_possible
-feature_base_rates_distribution = zeros(1, max_feature_value_possible);
-for v = 1:max_feature_value_possible
-    feature_base_rates_distribution(v) = gen_g_env * (1 - gen_g_env)^(v - 1);
+% Model Parameters (from Shiffrin & Steyvers, 1997, default values)
+% The number of features that the geometric distribution contains
+% Default 1000
+param.num_total_features = 1000;
+fprintf('  Number of total features: %d\n', param.num_total_features);
+
+% 'w' - The number of non-zero features that define a word
+% Default 20
+param.w_word_features = 20;
+fprintf('  Number of word features (w): %d\n', param.w_word_features);
+
+% 'g' - The geometric distribution parameter for feature values
+% Default 0.4
+param.g = 0.4;
+fprintf('  Geometric distribution parameter (g): %.2f\n', param.g);
+
+% 'u*' - The probability of storing a feature per storage attempt
+% Default 0.04
+param.u_star = 0.04;
+fprintf('  Probability of storing a feature per attempt (u*): %.2f\n', param.u_star);
+
+% 't' - The number of storage attempts (the units of time a word is studied)
+% Default 10
+param.t = 10;
+fprintf('  Number of storage attempts (t): %d\n', param.t);
+
+% 'c' - The probability that a word is copied correctly, assuming it the feature is stored
+% Default 0.7
+param.c = 0.7;
+fprintf('  Probability of correct copy (c): %.2f\n', param.c);
+
+% The threshold for 'old' versus 'new' responses (phi >= criterion)
+% Default 1.0
+% This is the single criterion for P(H)/P(F) and d' calculations
+% The NRS slope calculations use different criteria defined in log_criteria
+param.criterion = 1.0;
+fprintf('  Recognition criterion: %.1f\n', param.criterion);
+
+% Define the specific log-criteria used in the paper for ROC curve generation (for NRS)
+log_criteria = [1.0, -0.8, -0.7, -0.2, 0, 0.2, 0.7, 1.0, 1.25, 1.75, 2.5];
+roc_criteria = exp(log_criteria);
+
+% List lengths to simulate
+% Default [4, 10, 20, 40, 80] from Figure 3
+sim.list_lengths_to_simulate = [4, 10, 20, 40, 80];
+
+% Number of internal simulation runs to average results over for a single point
+sim.num_simulations_per_point = 1000;
+fprintf('  Number of internal simulations per point: %d\n', sim.num_simulations_per_point);
+
+% Number of repetitions to run the entire simulation for standard error of the mean error bar calculation
+sim.num_repetitions_for_error_bars = 100;
+fprintf('  Number of repetitions for error bars: %d\n', sim.num_repetitions_for_error_bars);
+
+% --- Initialize Storage for Data and Error Bars ---
+num_list_lengths = length(sim.list_lengths_to_simulate);
+
+% Store results for each repetition for each list length
+all_reps_PH = zeros(num_list_lengths, sim.num_repetitions_for_error_bars);
+all_reps_PF = zeros(num_list_lengths, sim.num_repetitions_for_error_bars);
+all_reps_d_prime = zeros(num_list_lengths, sim.num_repetitions_for_error_bars);
+all_reps_NRS = zeros(num_list_lengths, sim.num_repetitions_for_error_bars);
+
+disp('Starting simulations for different list lengths...');
+
+% --- Start Parallel Pool (if not already open) ---
+% This ensures that `parfor` has workers available.
+if isempty(gcp('nocreate'))
+    parpool;
 end
-% Normalize the distribution to ensure it sums to 1 (important for sampling later)
-feature_base_rates_distribution = feature_base_rates_distribution / sum(feature_base_rates_distribution);
 
-
-% 2. Lexical Prototypes (Word Representations)
-% Model parameters for word generation
-number_of_prototypes = 1000; % n: Total size of the vocabulary
-number_of_word_features = 20; % w: Number of non-zero features per word
-gen_g_H = 0.25; % g_H: Parameter for high-frequency words
-gen_g_L = 0.05; % g_L: Parameter for low-frequency words
-prop_high_freq = 0.5; % Proportion of high-frequency words in the lexicon
-
-% Error handling for n and w
-if number_of_prototypes <= 0 || mod(number_of_prototypes, 1) ~= 0
-    error('number_of_prototypes must be a positive integer.');
-end
-if number_of_word_features <= 0 || mod(number_of_word_features, 1) ~= 0
-    error('number_of_word_features must be a positive integer.');
-end
-if number_of_word_features > max_feature_value_possible
-    error('number_of_word_features cannot exceed max_feature_value_possible.');
-end
-
-word_prototypes = zeros(number_of_prototypes, max_feature_value_possible);
-word_frequencies = cell(1, number_of_prototypes); % To store 'high' or 'low' frequency type
-
-% Create cumulative distribution functions (CDFs) for g_H and g_L to enable sampling
-% The range of values for a geometric distribution can be large, so ensure CDF covers sufficient range
-cdf_g_H = cumsum(gen_g_H * (1 - gen_g_H).^(0:max_feature_value_possible-1));
-cdf_g_L = cumsum(gen_g_L * (1 - gen_g_L).^(0:max_feature_value_possible-1));
-
-for i = 1:number_of_prototypes
-    % Assign frequency type
-    if rand() < prop_high_freq
-        word_frequencies{i} = 'high';
-        current_cdf = cdf_g_H;
-    else
-        word_frequencies{i} = 'low';
-        current_cdf = cdf_g_L;
-    end
+% --- Loop to Simulate For Each List Length ---
+for ll_idx = 1:num_list_lengths
     
-    % Generate w non-zero features
-    % Initialize a temporary vector to hold the w non-zero features
-    non_zero_features_temp = zeros(1, number_of_word_features);
-    for j = 1:number_of_word_features
-        r = rand();
-        % Sample a feature value from the geometric distribution using its CDF
-        % find returns the first index where the condition is true
-        non_zero_features_temp(j) = find(current_cdf >= r, 1, 'first');
-    end
+    % Update the current list length for the simulation
+    current_list_length = sim.list_lengths_to_simulate(ll_idx);
+    % We need a local copy of sim.list_length for each parfor iteration
+    % or pass it as a parameter if it changes per iteration.
+    % Here, current_list_length is constant for the inner parfor loop, so it's fine.
     
-    % Place these features into randomly chosen positions within the word_prototype vector
-    % Ensure the selected positions are unique for this word
-    feature_indices = randperm(max_feature_value_possible, number_of_word_features);
-    word_prototypes(i, feature_indices) = non_zero_features_temp;
-end
-
-disp('Representation section complete.');
-
-%% Storage
-
-% Model parameters for storage
-number_of_words_to_study = 50; % z: Number of words to be studied (targets)
-units_of_time = 10; % x: Number of storage attempts (e.g., for 'strong' words)
-probability_of_storage = 0.5; % u*: Probability of a feature being stored in an attempt
-copying_accuracy = 0.9; % c: Probability of correct feature transfer
-
-% 1. Select Study Words
-% Randomly select z word prototypes from the word_prototypes array
-study_indices = randperm(number_of_prototypes, number_of_words_to_study);
-studied_word_prototypes = word_prototypes(study_indices, :);
-
-% 2. Initialize Stored Traces
-% Initialize z empty vectors, each of length max_feature_value_possible, with all values 0
-stored_episodic_traces = zeros(number_of_words_to_study, max_feature_value_possible);
-
-% 3. Simulate Storage Attempts
-for i = 1:number_of_words_to_study
-    current_word_prototype = studied_word_prototypes(i, :);
-    current_stored_trace = zeros(1, max_feature_value_possible); % Temporary trace for this word
+    fprintf('\n--- List Length: %d ---\n', current_list_length);
     
-    for attempt = 1:units_of_time
-        for feature_pos = 1:max_feature_value_possible
-            % If the feature at this position has NOT already been stored
-            if current_stored_trace(feature_pos) == 0
-                % Probability of storage attempt success (u*)
-                if rand() < probability_of_storage
-                    % Copying accuracy (c)
-                    if rand() < copying_accuracy
-                        % Correctly copy feature from prototype
-                        current_stored_trace(feature_pos) = current_word_prototype(feature_pos);
-                    else
-                        % Error: Store a random feature value from environmental distribution
-                        % Sample from the environmental feature_base_rates_distribution
-                        % Generate a random value between 0 and 1
-                        r_val = rand();
-                        % Find which bin this random value falls into based on CDF
-                        cumulative_env_dist = cumsum(feature_base_rates_distribution);
-                        random_feature_value = find(cumulative_env_dist >= r_val, 1, 'first');
-                        current_stored_trace(feature_pos) = random_feature_value;
-                    end
-                end
-            end
-        end
-    end
-    % Store the finalized episodic trace for this word
-    stored_episodic_traces(i, :) = current_stored_trace;
-end
+    % --- Loop to Repeat Simulations For Each List Length (to calculate Error Bars) ---
+    % THIS IS THE LOOP TO PARALLELIZE
+    parfor rep_idx = 1:sim.num_repetitions_for_error_bars
+        % To ensure reproducibility of random numbers within each worker's
+        % stream for `parfor`, you might want to manage the random number
+        % stream here if precise per-replication reproducibility is critical
+        % beyond the overall average. For general simulation, often not strictly
+        % necessary, as `parfor` handles separate streams.
+        % For example: rng(rep_idx + ll_idx * sim.num_repetitions_for_error_bars);
 
-disp('Storage section complete.');
-
-%% Retrieval
-
-% 1. Create Probe Traces
-number_of_test_probes = 2 * number_of_words_to_study; % 2z probes (z targets + z distractors)
-probe_vectors = zeros(number_of_test_probes, max_feature_value_possible);
-probe_types = cell(1, number_of_test_probes); % To store 'target' or 'distractor' type
-
-% Add targets (studied words)
-probe_vectors(1:number_of_words_to_study, :) = studied_word_prototypes;
-probe_types(1:number_of_words_to_study) = {'target'};
-
-% Add distractors (randomly selected non-studied words)
-% Ensure distractors are not from the studied set
-non_studied_indices = setdiff(1:number_of_prototypes, study_indices);
-% Use datasample to pick without replacement
-distractor_indices = datasample(non_studied_indices, number_of_words_to_study, 'Replace', false);
-probe_vectors(number_of_words_to_study+1:end, :) = word_prototypes(distractor_indices, :);
-probe_types(number_of_words_to_study+1:end) = {'distractor'};
-
-% Initialize storage for all likelihood ratios
-all_probe_likelihood_ratios = cell(1, number_of_test_probes);
-
-% Likelihood Ratio Calculation Function logic (implemented inline for clarity)
-for p = 1:number_of_test_probes
-    current_probe_vector = probe_vectors(p, :);
-    lambda_j_values_for_probe = zeros(1, size(stored_episodic_traces, 1)); % One lambda_j for each stored trace
-    
-    for j = 1:size(stored_episodic_traces, 1) % Iterate through each stored episodic trace
-        current_stored_trace = stored_episodic_traces(j, :);
-        total_likelihood_ratio = 1.0; % Initialize for multiplicative combination
+        % --- Initialize Performance Metrics for current list length and repetition ---
+        total_hits = 0;
+        total_false_alarms = 0;
         
-        for feature_pos = 1:max_feature_value_possible % Iterate through each feature position
-            probe_feature = current_probe_vector(feature_pos);
-            trace_feature = current_stored_trace(feature_pos);
+        % Initialize arrays to store phi values for d' and NRS calculation for THIS list length and THIS repetition
+        all_phi_targets = zeros(1, sim.num_simulations_per_point);
+        all_phi_distractors = zeros(1, sim.num_simulations_per_point);
+        
+        % --- Loop to Simulate Each Point ---
+        for sim_idx = 1:sim.num_simulations_per_point
+            % --- Generate Study List and Simulate Storage ---
+            % Initialize an empty array of word vectors
+            study_words = cell(current_list_length, 1);
+            % Initialize an empty array of episodic images
+            memory_images = cell(current_list_length, 1);
             
-            local_lambda = 1.0; % Default local contribution (for features providing no evidence)
-            
-            % Get P(v) for the probe feature value from the environmental distribution
-            % Ensure valid index and value exists in distribution
-            prob_probe_feature_env = 0;
-            if probe_feature > 0 && probe_feature <= max_feature_value_possible
-                prob_probe_feature_env = feature_base_rates_distribution(probe_feature);
-            end
-
-            % Implement Equations 2, 3, 4A, 4B logic based on Shiffrin & Steyvers (1997)
-            if trace_feature > 0 % Feature is present in the stored trace (I_j(f) > 0)
-                if probe_feature == trace_feature % Match: I_j(f) = V(f) > 0 (Equation 2)
-                    % P(V(f)|s) / P(V(f)|d) = 1 / P(V(f))
-                    if prob_probe_feature_env > 0
-                        local_lambda = 1 / prob_probe_feature_env;
-                    else
-                        local_lambda = 1e-10; % Avoid division by zero, very small likelihood for extremely rare features
-                    end
-                else % Mismatch: I_j(f) > 0 and V(f) != I_j(f) (Equation 3)
-                    % P(V(f)|s) / P(V(f)|d) = 0 / P(V(f)) = 0
-                    local_lambda = 1e-10; % Effectively zero, representing a strong mismatch
-                end
-            else % Feature is absent in the stored trace (I_j(f) = 0)
-                if probe_feature > 0 % Probe feature present (V(f) > 0), trace feature absent (Equation 4A)
-                    % This represents a feature from the studied word that was not stored or stored incorrectly.
-                    % P(V(f)|s) / P(V(f)|d) where P(V(f)|s) is the probability of this configuration.
-                    % The paper often implies this is (1 - probability_of_correct_storage_of_this_feature)
-                    % which is (1 - u*c) for a feature that was originally present.
-                    local_lambda = (1 - probability_of_storage * copying_accuracy);
-                    if local_lambda <= 0
-                        local_lambda = 1e-10; % Ensure it's not zero or negative
-                    end
-                else % Probe feature absent (V(f) = 0), trace feature absent (Equation 4B)
-                    % This corresponds to a feature position that is zero in both the probe and the trace.
-                    % These positions provide no unique evidence for old/new.
-                    local_lambda = 1.0; 
-                end
+            % For the number of words in the list length
+            for i = 1:current_list_length
+                % Create a word vector representation from the geometric distribution
+                study_words{i} = generate_word_vector(param.num_total_features, param.w_word_features, param.g);
+                % Store the word in memory as an episodic image, which may have errors
+                memory_images{i} = store_word_into_memory(study_words{i}, param.u_star, param.t, param.c, param.g);
             end
             
-            total_likelihood_ratio = total_likelihood_ratio * local_lambda;
+            % --- Simulate a Target Trial (Recognition of a Studied Word) ---
+            % Randomly select one studied word to be the target probe
+            target_idx = randi(current_list_length);
+            probe_target = study_words{target_idx};
+            
+            % Calculate the overall odds (phi) for the target probe
+            phi_target = calculate_overall_odds(probe_target, memory_images, param.c, param.g);
+            
+            % Make recognition decision
+            if phi_target >= param.criterion
+                total_hits = total_hits + 1;
+            end
+            
+            % Store phi_target for later calculation of d' and NRS
+            all_phi_targets(sim_idx) = phi_target;
+            
+            % --- Simulate a Distractor Trial (Recognition of an Unstudied Word) ---
+            % Generate a new word that was NOT in the study list (a distractor)
+            probe_distractor = generate_word_vector(param.num_total_features, param.w_word_features, param.g);
+            
+            % Calculate the overall odds (phi) for the distractor probe
+            phi_distractor = calculate_overall_odds(probe_distractor, memory_images, param.c, param.g);
+            
+            % Make recognition decision
+            if phi_distractor >= param.criterion
+                total_false_alarms = total_false_alarms + 1;
+            end
+            
+            % Store phi_distractor for later calculation of d' and NRS
+            all_phi_distractors(sim_idx) = phi_distractor;
         end
-        lambda_j_values_for_probe(j) = total_likelihood_ratio;
+        
+        % --- Calculate and Store Results for Current List Length and Repetition ---
+        % Probability of hits for the current criterion
+        P_H_current = total_hits / sim.num_simulations_per_point;
+        all_reps_PH(ll_idx, rep_idx) = P_H_current; % Sliced variable
+        
+        % Probability of false alarms for the current criterion
+        P_F_current = total_false_alarms / sim.num_simulations_per_point;
+        all_reps_PF(ll_idx, rep_idx) = P_F_current; % Sliced variable
+        
+        % Calculate d' for the current list length and repetition
+        z_hit_current = norminv(P_H_current, 0, 1);
+        z_false_alarm_current = norminv(P_F_current, 0, 1);
+        d_prime_current = z_hit_current - z_false_alarm_current;
+        all_reps_d_prime(ll_idx, rep_idx) = d_prime_current; % Sliced variable
+        
+        % --- NRS (Normal-ROC Slope) Calculation for Current List Length and Repetition ---
+        % Calculate P(H) and P(F) for each ROC criterion from the collected phi distributions
+        roc_PH_current_ll_rep = zeros(1, length(roc_criteria));
+        roc_PF_current_ll_rep = zeros(1, length(roc_criteria));
+        for i = 1:length(roc_criteria)
+            current_roc_criterion = roc_criteria(i);
+            roc_PH_current_ll_rep(i) = sum(all_phi_targets >= current_roc_criterion) / sim.num_simulations_per_point;
+            roc_PF_current_ll_rep(i) = sum(all_phi_distractors >= current_roc_criterion) / sim.num_simulations_per_point;
+        end
+        
+        % Convert ROC points to z-scores
+        z_roc_PH = norminv(roc_PH_current_ll_rep, 0, 1);
+        z_roc_PF = norminv(roc_PF_current_ll_rep, 0, 1);
+        
+        % Filter out non-finite values (Inf or -Inf) as they cannot be used in linear regression
+        valid_indices_roc = isfinite(z_roc_PH) & isfinite(z_roc_PF);
+        z_roc_PH_filtered = z_roc_PH(valid_indices_roc);
+        z_roc_PF_filtered = z_roc_PF(valid_indices_roc);
+        
+        nrs_current = NaN; % Initialize NRS as NaN in case calculation fails
+        if length(z_roc_PF_filtered) >= 2
+            % Fit a linear regression line to the z-ROC points
+            coefficients_roc = polyfit(z_roc_PF_filtered, z_roc_PH_filtered, 1);
+            nrs_current = coefficients_roc(1); % The first coefficient is the slope
+        else
+            % disp('Warning: Not enough valid (P(F), P(H)) pairs for NRS calculation for this list length and repetition.');
+        end
+        all_reps_NRS(ll_idx, rep_idx) = nrs_current; % Sliced variable
     end
-    all_probe_likelihood_ratios{p} = lambda_j_values_for_probe;
 end
 
-disp('Retrieval section complete.');
+disp('--- All Simulations Complete ---');
 
-%% Bayesian decision
+% --- Calculate Mean and Standard Deviation Across Repetitions ---
+% Mean forp robability of hits
+mean_PH = mean(all_reps_PH, 2)';
+% Standard deviation for probability of hits
+std_PH = std(all_reps_PH, 0, 2)';
 
-% Initialize results storage
-num_hits = 0;
-num_false_alarms = 0;
-num_misses = 0;
-num_correct_rejections = 0;
+% Mean for probability of false alarms
+mean_PF = mean(all_reps_PF, 2)';
+% Standard deviation for probability of false alarms
+std_PF = std(all_reps_PF, 0, 2)';
 
-% Store individual probe decisions and odds for later analysis (e.g., ROC)
-probe_decisions = cell(1, number_of_test_probes);
-probe_odds = zeros(1, number_of_test_probes);
+% Mean for d'
+mean_d_prime = mean(all_reps_d_prime, 2)';
+% Standard deviation for d'
+std_d_prime = std(all_reps_d_prime, 0, 2)';
 
-% Decision criterion: Odds > 1.0 corresponds to P(Old|Data) > 0.5
-criterion_odds = 1.0; 
+% Mean for NRS
+mean_NRS = mean(all_reps_NRS, 2)';
+% Standard deviation for NRS
+std_NRS = std(all_reps_NRS, 0, 2)';
 
-for p = 1:number_of_test_probes
-    current_lambda_j_values = all_probe_likelihood_ratios{p};
-    
-    % 1. Calculate Odds of 'Old'
-    % Average of all lambda_j values for the current probe across all stored traces
-    odds_old = mean(current_lambda_j_values);
-    probe_odds(p) = odds_old;
-    
-    % 2. Make Decision
-    if odds_old > criterion_odds
-        decision = 'Old';
+fprintf('\n--- Final Mean Results Across Repetitions ---\n');
+for i = 1:num_list_lengths
+    fprintf('List Length %d:\n', sim.list_lengths_to_simulate(i));
+    fprintf('  Mean P(H): %.4f (SD: %.4f)\n', mean_PH(i), std_PH(i));
+    fprintf('  Mean P(F): %.4f (SD: %.4f)\n', mean_PF(i), std_PF(i));
+    fprintf('  Mean d'': %.4f (SD: %.4f)\n', mean_d_prime(i), std_d_prime(i));
+    fprintf('  Mean NRS: %.4f (SD: %.4f)\n', mean_NRS(i), std_NRS(i));
+end
+
+% --- Plotting Results with Error Bars ---
+% Create a new figure for the plots
+figure; 
+% Adjust figure size for vertical stacking
+set(gcf, 'Units', 'normalized', 'Position', [0.1 0.1 0.5 0.9]);
+
+% Common X-axis settings for all plots
+x_labels = arrayfun(@num2str, sim.list_lengths_to_simulate, 'UniformOutput', false);
+
+% Plot 1: d' vs. List Length
+% 3 rows, 1 column, first plot
+subplot(3, 1, 1);
+errorbar(sim.list_lengths_to_simulate, mean_d_prime, std_d_prime, 'o-', 'LineWidth', 1.5, 'Color', 'g');
+title('d-prime (d'')');
+xlabel('List Length (n)');
+ylabel('d''');
+grid on;
+xticks(sim.list_lengths_to_simulate);
+xticklabels(x_labels);
+xlim([min(sim.list_lengths_to_simulate) - 2, max(sim.list_lengths_to_simulate) + 2]);
+
+% Plot 2: Hit Rate and False Alarm Rate vs. List Length
+% 3 rows, 1 column, second plot
+subplot(3, 1, 2);
+errorbar(sim.list_lengths_to_simulate, mean_PH, std_PH, 'o-', 'LineWidth', 1.5, 'Color', 'b', 'DisplayName', 'Hit Rate P(H)');
+hold on;
+errorbar(sim.list_lengths_to_simulate, mean_PF, std_PF, 's-', 'LineWidth', 1.5, 'Color', 'r', 'DisplayName', 'False Alarm Rate P(F)');
+hold off;
+title('Hit Rate and False Alarm Rate');
+xlabel('List Length (n)');
+ylabel('Probability');
+grid on;
+xticks(sim.list_lengths_to_simulate);
+xticklabels(x_labels);
+xlim([min(sim.list_lengths_to_simulate) - 2, max(sim.list_lengths_to_simulate) + 2]);
+legend('show', 'Location', 'best');
+
+% Plot 3: Normal ROC Slope (NRS) vs. List Length
+% 3 rows, 1 column, third plot
+subplot(3, 1, 3);
+errorbar(sim.list_lengths_to_simulate, mean_NRS, std_NRS, 'o-', 'LineWidth', 1.5, 'Color', 'm');
+title('Normal ROC Slope (NRS)');
+xlabel('List Length (n)');
+ylabel('NRS');
+grid on;
+xticks(sim.list_lengths_to_simulate);
+xticklabels(x_labels);
+xlim([min(sim.list_lengths_to_simulate) - 2, max(sim.list_lengths_to_simulate) + 2]);
+sgtitle('REM.1 List Length and Predictions with SEM Error Bars');
+
+% --- Helper Functions (No changes needed for parfor) ---
+% Function to generate a word vector with 'w' non-zero features; the remaining features are zeros
+function word_vector = generate_word_vector(num_total_features, w_word_features, g_param)
+    word_vector = zeros(1, num_total_features);
+    feature_indices = randperm(num_total_features, w_word_features);
+    feature_values = geornd(g_param, 1, w_word_features) + 1;
+    word_vector(feature_indices) = feature_values;
+end
+
+% Function to simulate storing a word into memory
+function episodic_image = store_word_into_memory(word_vector, u_star, t_attempts, c_copy, g_param)
+    episodic_image = zeros(size(word_vector));
+    word_nz_indices = find(word_vector ~= 0);
+    for k = word_nz_indices
+        original_val = word_vector(k);
+        feature_stored = false;
+        for attempt = 1:t_attempts
+            if rand() < u_star
+                if rand() < c_copy
+                    episodic_image(k) = original_val;
+                else
+                    random_val = geornd(g_param) + 1;
+                    episodic_image(k) = random_val;
+                end
+                feature_stored = true;
+                break;
+            end
+        end
+    end
+end
+
+% Function to calculate the likelihood ratio for a single image given a probe
+function lambda_j = calculate_lambda_single_image(probe_vector, image_vector, c_copy, g_param)
+    lambda_j = 1.0;
+    for k = 1:length(probe_vector)
+        probe_val = probe_vector(k);
+        image_val = image_vector(k);
+        if probe_val ~= 0 && image_val ~= 0
+            if probe_val == image_val
+                denominator = g_param * ((1 - g_param)^(probe_val - 1));
+                if denominator > eps
+                     lambda_j = lambda_j * ((1 - c_copy) + c_copy / denominator);
+                else
+                    lambda_j = lambda_j * 1e10;
+                end
+            else
+                lambda_j = lambda_j * (1 - c_copy);
+            end
+        end
+    end
+end
+
+% Function to calculate the overall odds (phi) for a probe
+function phi = calculate_overall_odds(probe_vector, memory_images, c_copy, g_param)
+    sum_lambda = 0;
+    n_images = length(memory_images);
+    for i = 1:n_images
+        current_image = memory_images{i};
+        sum_lambda = sum_lambda + calculate_lambda_single_image(probe_vector, current_image, c_copy, g_param);
+    end
+    if n_images > 0
+        phi = sum_lambda / n_images;
     else
-        decision = 'New';
-    end
-    probe_decisions{p} = decision;
-    
-    % 3. Record Results for performance evaluation
-    if strcmp(probe_types{p}, 'target')
-        if strcmp(decision, 'Old')
-            num_hits = num_hits + 1;
-        else
-            num_misses = num_misses + 1;
-        end
-    else % probe_type is 'distractor'
-        if strcmp(decision, 'Old')
-            num_false_alarms = num_false_alarms + 1;
-        else
-            num_correct_rejections = num_correct_rejections + 1;
-        end
+        phi = 0;
     end
 end
-
-% Display summary results (for basic verification of simulation outcome)
-fprintf('\nBayesian Decision Section Complete.\n');
-fprintf('Total Targets: %d\n', number_of_words_to_study);
-fprintf('Total Distractors: %d\n', number_of_words_to_study);
-fprintf('Hits: %d\n', num_hits);
-fprintf('Misses: %d\n', num_misses);
-fprintf('False Alarms: %d\n', num_false_alarms);
-fprintf('Correct Rejections: %d\n', num_correct_rejections);
-
-% Calculate and display basic performance metrics
-hit_rate = num_hits / number_of_words_to_study;
-fa_rate = num_false_alarms / number_of_words_to_study;
-fprintf('Hit Rate: %.4f\n', hit_rate);
-fprintf('False Alarm Rate: %.4f\n', fa_rate);
-
-disp('Simulation complete.');
