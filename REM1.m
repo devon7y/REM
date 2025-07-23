@@ -62,7 +62,7 @@ sim.num_simulations_per_point = 1000;
 fprintf('  Number of internal simulations per point: %d\n', sim.num_simulations_per_point);
 
 % Number of repetitions to run the entire simulation for standard error of the mean error bar calculation
-sim.num_repetitions_for_error_bars = 100;
+sim.num_repetitions_for_error_bars = 10;
 fprintf('  Number of repetitions for error bars: %d\n', sim.num_repetitions_for_error_bars);
 
 % --- Initialize Storage for Data and Error Bars ---
@@ -115,22 +115,23 @@ for ll_idx = 1:num_list_lengths
         for sim_idx = 1:sim.num_simulations_per_point
             % --- Generate Study List and Simulate Storage ---
             % Initialize an empty array of word vectors
-            study_words = cell(current_list_length, 1);
+            study_words = zeros(current_list_length, param.num_total_features);
             % Initialize an empty array of episodic images
             memory_images = zeros(current_list_length, param.num_total_features);
             
             % For the number of words in the list length
             for i = 1:current_list_length
                 % Create a word vector representation from the geometric distribution
-                study_words{i} = generate_word_vector(param.num_total_features, param.w_word_features, param.g);
+                study_words(i, :) = generate_word_vector(param.num_total_features, param.w_word_features, param.g);
+
                 % Store the word in memory as an episodic image, which may have errors
-                memory_images(i, :) = store_word_into_memory(study_words{i}, param.u_star, param.t, param.c, param.g);
+                memory_images(i, :) = store_word_into_memory(study_words(i, :), param.u_star, param.t, param.c, param.g);
             end
             
             % --- Simulate a Target Trial (Recognition of a Studied Word) ---
             % Randomly select one studied word to be the target probe
             target_idx = randi(current_list_length);
-            probe_target = study_words{target_idx};
+            probe_target = study_words(target_idx, :);
             
             % Calculate the overall odds (phi) for the target probe
             phi_target = calculate_overall_odds(probe_target, memory_images, param.c, param.g);
@@ -287,7 +288,7 @@ xticklabels(x_labels);
 xlim([min(sim.list_lengths_to_simulate) - 2, max(sim.list_lengths_to_simulate) + 2]);
 sgtitle('REM.1 List Length and Predictions with SEM Error Bars');
 
-% --- Helper Functions (No changes needed for parfor) ---
+% --- Helper Functions ---
 % Function to generate a word vector with 'w' non-zero features; the remaining features are zeros
 function word_vector = generate_word_vector(num_total_features, w_word_features, g_param)
     word_vector = zeros(1, num_total_features);
@@ -297,46 +298,83 @@ function word_vector = generate_word_vector(num_total_features, w_word_features,
 end
 
 % Function to simulate storing a word into memory
+% Function to simulate storing a word into memory
 function episodic_image = store_word_into_memory(word_vector, u_star, t_attempts, c_copy, g_param)
-    episodic_image = zeros(size(word_vector));
-    word_nz_indices = find(word_vector ~= 0);
-    for k = word_nz_indices
-        original_val = word_vector(k);
-        feature_stored = false;
-        for attempt = 1:t_attempts
-            if rand() < u_star
-                if rand() < c_copy
-                    episodic_image(k) = original_val;
-                else
-                    random_val = geornd(g_param) + 1;
-                    episodic_image(k) = random_val;
-                end
-                feature_stored = true;
-                break;
-            end
-        end
+    episodic_image = zeros(size(word_vector)); % Preallocated, good
+    word_nz_indices = find(word_vector ~= 0); % Indices of active features
+
+    if isempty(word_nz_indices)
+        return; % No non-zero features to store
+    end
+
+    num_active_features = length(word_nz_indices);
+
+    % 1. Determine which non-zero features are stored at least once
+    % Probability that a feature is stored successfully at least once in t_attempts
+    p_stored_at_all = 1 - (1 - u_star)^t_attempts;
+    
+    % Generate random numbers for each active feature to see if it's stored
+    is_stored_mask = rand(1, num_active_features) < p_stored_at_all;
+    
+    % Get the indices of features that will be stored
+    stored_features_indices_in_nz = word_nz_indices(is_stored_mask);
+
+    if isempty(stored_features_indices_in_nz)
+        return; % No features were stored
+    end
+
+    % 2. For the stored features, determine if they are copied correctly or erroneously
+    % Generate random numbers for these stored features to check for correct copy
+    is_correct_copy_mask = rand(1, length(stored_features_indices_in_nz)) < c_copy;
+
+    % Indices of correctly copied features in the original word_vector
+    correct_copy_global_indices = stored_features_indices_in_nz(is_correct_copy_mask);
+    % Indices of erroneously copied features in the original word_vector
+    erroneous_copy_global_indices = stored_features_indices_in_nz(~is_correct_copy_mask);
+
+    % 3. Assign values to episodic_image
+    % Assign original values for correctly copied features
+    episodic_image(correct_copy_global_indices) = word_vector(correct_copy_global_indices);
+
+    % Assign new random values for erroneously copied features
+    if ~isempty(erroneous_copy_global_indices)
+        num_erroneous = length(erroneous_copy_global_indices);
+        % Generate random values for erroneous features
+        erroneous_feature_values = geornd(g_param, 1, num_erroneous) + 1;
+        episodic_image(erroneous_copy_global_indices) = erroneous_feature_values;
     end
 end
 
 % Function to calculate the likelihood ratio for a single image given a probe
 function lambda_j = calculate_lambda_single_image(probe_vector, image_vector, c_copy, g_param)
     lambda_j = 1.0;
-    for k = 1:length(probe_vector)
+
+    % Find indices where both probe and image vectors have non-zero values
+    common_nz_indices = find(probe_vector ~= 0 & image_vector ~= 0);
+
+    % Process only these relevant indices
+    for k_idx = 1:length(common_nz_indices)
+        k = common_nz_indices(k_idx); % Get the actual feature index
         probe_val = probe_vector(k);
         image_val = image_vector(k);
-        if probe_val ~= 0 && image_val ~= 0
-            if probe_val == image_val
-                denominator = g_param * ((1 - g_param)^(probe_val - 1));
-                if denominator > eps
-                     lambda_j = lambda_j * ((1 - c_copy) + c_copy / denominator);
-                else
-                    lambda_j = lambda_j * 1e10;
-                end
+
+        % The original logic remains the same for these elements
+        if probe_val == image_val
+            denominator = g_param * ((1 - g_param)^(probe_val - 1));
+            if denominator > eps
+                 lambda_j = lambda_j * ((1 - c_copy) + c_copy / denominator);
             else
-                lambda_j = lambda_j * (1 - c_copy);
+                lambda_j = lambda_j * 1e10; % Handle near-zero denominator
             end
+        else
+            lambda_j = lambda_j * (1 - c_copy); % Mismatch of non-zero features
         end
     end
+    % Features where either probe_val or image_val is zero:
+    % If probe_val is 0 and image_val is 0: lambda contribution is 1 (no change to lambda_j)
+    % If probe_val is 0 and image_val is non-zero: lambda contribution is 1 (no change)
+    % If probe_val is non-zero and image_val is 0: lambda contribution is 1 (no change)
+    % These cases are implicitly handled by the loop only considering common_nz_indices
 end
 
 % Function to calculate the overall odds (phi) for a probe
