@@ -14,12 +14,12 @@ disp('Parameters:');
 % Model Parameters (from Shiffrin & Steyvers, 1997, default values)
 % The number of features that the geometric distribution contains
 % Default 1000
-param.num_total_features = 1000;
+param.num_total_features = 20; % Set to 20 as per your request
 fprintf('  Number of total features: %d\n', param.num_total_features);
 
 % 'w' - The number of non-zero features that define a word
 % Default 20
-param.w_word_features = 20;
+param.w_word_features = 20; % Set to 20 as per your request
 fprintf('  Number of word features (w): %d\n', param.w_word_features);
 
 % 'g' - The geometric distribution parameter for feature values
@@ -58,8 +58,10 @@ roc_criteria = exp(log_criteria);
 sim.list_lengths_to_simulate = [4, 10, 20, 40, 80];
 
 % Number of internal simulation runs to average results over for a single point
+% IMPORTANT: With your changes, this now represents the number of 'blocks'
+% of study/test lists, not individual test trials.
 sim.num_simulations_per_point = 1000;
-fprintf('  Number of internal simulations per point: %d\n', sim.num_simulations_per_point);
+fprintf('  Number of internal simulation blocks per point: %d\n', sim.num_simulations_per_point);
 
 % Number of repetitions to run the entire simulation for standard error of the mean error bar calculation
 sim.num_repetitions_for_error_bars = 10;
@@ -77,7 +79,6 @@ all_reps_NRS = zeros(num_list_lengths, sim.num_repetitions_for_error_bars);
 disp('Starting simulations for different list lengths...');
 
 % --- Start Parallel Pool (if not already open) ---
-% This ensures that `parfor` has workers available.
 if isempty(gcp('nocreate'))
     parpool;
 end
@@ -85,88 +86,95 @@ end
 % --- Loop to Simulate For Each List Length ---
 for ll_idx = 1:num_list_lengths
     
-    % Update the current list length for the simulation
     current_list_length = sim.list_lengths_to_simulate(ll_idx);
-    % We need a local copy of sim.list_length for each parfor iteration
-    % or pass it as a parameter if it changes per iteration.
-    % Here, current_list_length is constant for the inner parfor loop, so it's fine.
     
     fprintf('\n--- List Length: %d ---\n', current_list_length);
     
     % --- Loop to Repeat Simulations For Each List Length (to calculate Error Bars) ---
-    % THIS IS THE LOOP TO PARALLELIZE
     parfor rep_idx = 1:sim.num_repetitions_for_error_bars
-        % To ensure reproducibility of random numbers within each worker's
-        % stream for `parfor`, you might want to manage the random number
-        % stream here if precise per-replication reproducibility is critical
-        % beyond the overall average. For general simulation, often not strictly
-        % necessary, as `parfor` handles separate streams.
-        % For example: rng(rep_idx + ll_idx * sim.num_repetitions_for_error_bars);
-
+        
         % --- Initialize Performance Metrics for current list length and repetition ---
         total_hits = 0;
         total_false_alarms = 0;
         
         % Initialize arrays to store phi values for d' and NRS calculation for THIS list length and THIS repetition
-        all_phi_targets = zeros(1, sim.num_simulations_per_point);
-        all_phi_lures = zeros(1, sim.num_simulations_per_point);
+        % Now stores (num_simulations_per_point * current_list_length) phis for targets and lures
+        total_test_trials_per_rep = sim.num_simulations_per_point * current_list_length;
+        all_phi_targets = zeros(1, total_test_trials_per_rep);
+        all_phi_lures = zeros(1, total_test_trials_per_rep);
         
-        % --- Loop to Simulate Each Point ---
+        phi_target_idx_counter = 0; % Counter for filling all_phi_targets
+        phi_lure_idx_counter = 0;   % Counter for filling all_phi_lures
+        
+        % --- Loop to Simulate Each Point (now each 'block' of study/test) ---
         for sim_idx = 1:sim.num_simulations_per_point
-            % --- Generate Study List and Simulate Storage ---
-            % Initialize an empty array of word vectors
-            study_words = zeros(current_list_length, param.num_total_features);
-            % Initialize an empty array of episodic images
+            % --- Generate Study List and Lure Pool for this block ---
+            % Generate 2 * list_length words in total for this block
+            total_words_for_block = 2 * current_list_length;
+            all_generated_words_for_block = zeros(total_words_for_block, param.num_total_features);
+
+            for j = 1:total_words_for_block
+                all_generated_words_for_block(j, :) = generate_word_vector(param.num_total_features, param.w_word_features, param.g);
+            end
+
+            % First half are study words (targets), second half are lures for this block
+            study_words = all_generated_words_for_block(1:current_list_length, :);
+            lure_words_pool = all_generated_words_for_block(current_list_length + 1 : end, :);
+
+            % Initialize episodic images (only for the studied words)
             memory_images = zeros(current_list_length, param.num_total_features);
             
-            % For the number of words in the list length
+            % For the number of words in the study list, store them in memory
             for i = 1:current_list_length
-                % Create a word vector representation from the geometric distribution
-                study_words(i, :) = generate_word_vector(param.num_total_features, param.w_word_features, param.g);
-
-                % Store the word in memory as an episodic image, which may have errors
                 memory_images(i, :) = store_word_into_memory(study_words(i, :), param.u_star, param.t, param.c, param.g);
             end
             
-            % --- Simulate a Target Trial (Recognition of a Studied Word) ---
-            % Randomly select one studied word to be the target probe
-            target_idx = randi(current_list_length);
-            probe_target = study_words(target_idx, :);
-            
-            % Calculate the overall odds (phi) for the target probe
-            phi_target = calculate_overall_odds(probe_target, memory_images, param.c, param.g);
-            
-            % Make recognition decision
-            if phi_target >= param.criterion
-                total_hits = total_hits + 1;
+            % --- Simulate Target Trials (All Studied Words in this block) ---
+            for target_word_idx = 1:current_list_length
+                probe_target = study_words(target_word_idx, :);
+                
+                % Calculate the overall odds (phi) for the target probe
+                phi_target = calculate_overall_odds(probe_target, memory_images, param.c, param.g);
+                
+                % Make recognition decision
+                if phi_target >= param.criterion
+                    total_hits = total_hits + 1;
+                end
+                
+                % Store phi_target
+                phi_target_idx_counter = phi_target_idx_counter + 1;
+                all_phi_targets(phi_target_idx_counter) = phi_target;
             end
             
-            % Store phi_target for later calculation of d' and NRS
-            all_phi_targets(sim_idx) = phi_target;
-            
-            % --- Simulate a Lure Trial (Recognition of an Unstudied Word) ---
-            % Generate a new word that was NOT in the study list (a lure)
-            probe_lure = generate_word_vector(param.num_total_features, param.w_word_features, param.g);
-            
-            % Calculate the overall odds (phi) for the lure probe
-            phi_lure = calculate_overall_odds(probe_lure, memory_images, param.c, param.g);
-            
-            % Make recognition decision
-            if phi_lure >= param.criterion
-                total_false_alarms = total_false_alarms + 1;
+            % --- Simulate Lure Trials (All Lures from the pre-generated pool in this block) ---
+            for lure_word_idx = 1:current_list_length
+                probe_lure = lure_words_pool(lure_word_idx, :);
+                
+                % Calculate the overall odds (phi) for the lure probe
+                phi_lure = calculate_overall_odds(probe_lure, memory_images, param.c, param.g);
+                
+                % Make recognition decision
+                if phi_lure >= param.criterion
+                    total_false_alarms = total_false_alarms + 1;
+                end
+                
+                % Store phi_lure
+                phi_lure_idx_counter = phi_lure_idx_counter + 1;
+                all_phi_lures(phi_lure_idx_counter) = phi_lure;
             end
-            
-            % Store phi_lure for later calculation of d' and NRS
-            all_phi_lures(sim_idx) = phi_lure;
-        end
+        end % End of sim_idx loop
         
         % --- Calculate and Store Results for Current List Length and Repetition ---
+        % Total number of *effective* trials is now sim.num_simulations_per_point * current_list_length
+        total_effective_trials_targets = sim.num_simulations_per_point * current_list_length;
+        total_effective_trials_lures = sim.num_simulations_per_point * current_list_length;
+
         % Probability of hits for the current criterion
-        P_H_current = total_hits / sim.num_simulations_per_point;
+        P_H_current = total_hits / total_effective_trials_targets; % Denominator changed
         all_reps_PH(ll_idx, rep_idx) = P_H_current; % Sliced variable
         
         % Probability of false alarms for the current criterion
-        P_F_current = total_false_alarms / sim.num_simulations_per_point;
+        P_F_current = total_false_alarms / total_effective_trials_lures; % Denominator changed
         all_reps_PF(ll_idx, rep_idx) = P_F_current; % Sliced variable
         
         % Calculate d' for the current list length and repetition
@@ -181,8 +189,8 @@ for ll_idx = 1:num_list_lengths
         roc_PF_current_ll_rep = zeros(1, length(roc_criteria));
         for i = 1:length(roc_criteria)
             current_roc_criterion = roc_criteria(i);
-            roc_PH_current_ll_rep(i) = sum(all_phi_targets >= current_roc_criterion) / sim.num_simulations_per_point;
-            roc_PF_current_ll_rep(i) = sum(all_phi_lures >= current_roc_criterion) / sim.num_simulations_per_point;
+            roc_PH_current_ll_rep(i) = sum(all_phi_targets >= current_roc_criterion) / total_effective_trials_targets; % Denominator changed
+            roc_PF_current_ll_rep(i) = sum(all_phi_lures >= current_roc_criterion) / total_effective_trials_lures;     % Denominator changed
         end
         
         % Convert ROC points to z-scores
@@ -209,24 +217,16 @@ end
 disp('--- All Simulations Complete ---');
 
 % --- Calculate Mean and Standard Deviation Across Repetitions ---
-% Mean forp robability of hits
 mean_PH = mean(all_reps_PH, 2)';
-% Standard deviation for probability of hits
 std_PH = std(all_reps_PH, 0, 2)';
 
-% Mean for probability of false alarms
 mean_PF = mean(all_reps_PF, 2)';
-% Standard deviation for probability of false alarms
 std_PF = std(all_reps_PF, 0, 2)';
 
-% Mean for d'
 mean_d_prime = mean(all_reps_d_prime, 2)';
-% Standard deviation for d'
 std_d_prime = std(all_reps_d_prime, 0, 2)';
 
-% Mean for NRS
 mean_NRS = mean(all_reps_NRS, 2)';
-% Standard deviation for NRS
 std_NRS = std(all_reps_NRS, 0, 2)';
 
 fprintf('\n--- Final Mean Results Across Repetitions ---\n');
@@ -239,35 +239,28 @@ for i = 1:num_list_lengths
 end
 
 % --- Plotting Results with Error Bars ---
-% Create a new figure for the plots
 figure; 
-% Adjust figure size for vertical stacking
 set(gcf, 'Units', 'normalized', 'Position', [0.1 0.1 0.5 0.9]);
 
-% Common X-axis settings for all plots
 x_labels = arrayfun(@num2str, sim.list_lengths_to_simulate, 'UniformOutput', false);
 
-% Plot 1: d' vs. List Length
-% 3 rows, 1 column, first plot
 subplot(3, 1, 1);
 errorbar(sim.list_lengths_to_simulate, mean_d_prime, std_d_prime, 'o-', 'LineWidth', 1.5, 'Color', 'g');
 title('d-prime (d'')');
-xlabel('List Length (n)');
+xlabel('List Length (L)');
 ylabel('d''');
 grid on;
 xticks(sim.list_lengths_to_simulate);
 xticklabels(x_labels);
 xlim([min(sim.list_lengths_to_simulate) - 2, max(sim.list_lengths_to_simulate) + 2]);
 
-% Plot 2: Hit Rate and False Alarm Rate vs. List Length
-% 3 rows, 1 column, second plot
 subplot(3, 1, 2);
 errorbar(sim.list_lengths_to_simulate, mean_PH, std_PH, 'o-', 'LineWidth', 1.5, 'Color', 'b', 'DisplayName', 'Hit Rate P(H)');
 hold on;
 errorbar(sim.list_lengths_to_simulate, mean_PF, std_PF, 's-', 'LineWidth', 1.5, 'Color', 'r', 'DisplayName', 'False Alarm Rate P(F)');
 hold off;
 title('Hit Rate and False Alarm Rate');
-xlabel('List Length (n)');
+xlabel('List Length (L)');
 ylabel('Probability');
 grid on;
 xticks(sim.list_lengths_to_simulate);
@@ -275,12 +268,10 @@ xticklabels(x_labels);
 xlim([min(sim.list_lengths_to_simulate) - 2, max(sim.list_lengths_to_simulate) + 2]);
 legend('show', 'Location', 'best');
 
-% Plot 3: Normal ROC Slope (NRS) vs. List Length
-% 3 rows, 1 column, third plot
 subplot(3, 1, 3);
 errorbar(sim.list_lengths_to_simulate, mean_NRS, std_NRS, 'o-', 'LineWidth', 1.5, 'Color', 'm');
 title('Normal ROC Slope (NRS)');
-xlabel('List Length (n)');
+xlabel('List Length (L)');
 ylabel('NRS');
 grid on;
 xticks(sim.list_lengths_to_simulate);
@@ -289,7 +280,6 @@ xlim([min(sim.list_lengths_to_simulate) - 2, max(sim.list_lengths_to_simulate) +
 sgtitle('REM.1 List Length and Predictions with SEM Error Bars');
 
 % --- Helper Functions ---
-% Function to generate a word vector with 'w' non-zero features; the remaining features are zeros
 function word_vector = generate_word_vector(num_total_features, w_word_features, g_param)
     word_vector = zeros(1, num_total_features);
     feature_indices = randperm(num_total_features, w_word_features);
@@ -297,87 +287,58 @@ function word_vector = generate_word_vector(num_total_features, w_word_features,
     word_vector(feature_indices) = feature_values;
 end
 
-% Function to simulate storing a word into memory
-% Function to simulate storing a word into memory
 function episodic_image = store_word_into_memory(word_vector, u_star, t_attempts, c_copy, g_param)
-    episodic_image = zeros(size(word_vector)); % Preallocated, good
-    word_nz_indices = find(word_vector ~= 0); % Indices of active features
+    episodic_image = zeros(size(word_vector));
+    word_nz_indices = find(word_vector ~= 0);
 
     if isempty(word_nz_indices)
-        return; % No non-zero features to store
+        return;
     end
 
     num_active_features = length(word_nz_indices);
-
-    % 1. Determine which non-zero features are stored at least once
-    % Probability that a feature is stored successfully at least once in t_attempts
     p_stored_at_all = 1 - (1 - u_star)^t_attempts;
-    
-    % Generate random numbers for each active feature to see if it's stored
     is_stored_mask = rand(1, num_active_features) < p_stored_at_all;
-    
-    % Get the indices of features that will be stored
     stored_features_indices_in_nz = word_nz_indices(is_stored_mask);
 
     if isempty(stored_features_indices_in_nz)
-        return; % No features were stored
+        return;
     end
 
-    % 2. For the stored features, determine if they are copied correctly or erroneously
-    % Generate random numbers for these stored features to check for correct copy
     is_correct_copy_mask = rand(1, length(stored_features_indices_in_nz)) < c_copy;
-
-    % Indices of correctly copied features in the original word_vector
     correct_copy_global_indices = stored_features_indices_in_nz(is_correct_copy_mask);
-    % Indices of erroneously copied features in the original word_vector
     erroneous_copy_global_indices = stored_features_indices_in_nz(~is_correct_copy_mask);
 
-    % 3. Assign values to episodic_image
-    % Assign original values for correctly copied features
     episodic_image(correct_copy_global_indices) = word_vector(correct_copy_global_indices);
 
-    % Assign new random values for erroneously copied features
     if ~isempty(erroneous_copy_global_indices)
         num_erroneous = length(erroneous_copy_global_indices);
-        % Generate random values for erroneous features
         erroneous_feature_values = geornd(g_param, 1, num_erroneous) + 1;
         episodic_image(erroneous_copy_global_indices) = erroneous_feature_values;
     end
 end
 
-% Function to calculate the likelihood ratio for a single image given a probe
 function lambda_j = calculate_lambda_single_image(probe_vector, image_vector, c_copy, g_param)
     lambda_j = 1.0;
-
-    % Find indices where both probe and image vectors have non-zero values
     common_nz_indices = find(probe_vector ~= 0 & image_vector ~= 0);
 
-    % Process only these relevant indices
     for k_idx = 1:length(common_nz_indices)
-        k = common_nz_indices(k_idx); % Get the actual feature index
+        k = common_nz_indices(k_idx);
         probe_val = probe_vector(k);
         image_val = image_vector(k);
 
-        % The original logic remains the same for these elements
         if probe_val == image_val
             denominator = g_param * ((1 - g_param)^(probe_val - 1));
             if denominator > eps
                  lambda_j = lambda_j * ((1 - c_copy) + c_copy / denominator);
             else
-                lambda_j = lambda_j * 1e10; % Handle near-zero denominator
+                lambda_j = lambda_j * 1e10; % Using a large constant to represent a very high likelihood
             end
         else
-            lambda_j = lambda_j * (1 - c_copy); % Mismatch of non-zero features
+            lambda_j = lambda_j * (1 - c_copy);
         end
     end
-    % Features where either probe_val or image_val is zero:
-    % If probe_val is 0 and image_val is 0: lambda contribution is 1 (no change to lambda_j)
-    % If probe_val is 0 and image_val is non-zero: lambda contribution is 1 (no change)
-    % If probe_val is non-zero and image_val is 0: lambda contribution is 1 (no change)
-    % These cases are implicitly handled by the loop only considering common_nz_indices
 end
 
-% Function to calculate the overall odds (phi) for a probe
 function phi = calculate_overall_odds(probe_vector, memory_images, c_copy, g_param)
     sum_lambda = 0;
     n_images = size(memory_images, 1);
